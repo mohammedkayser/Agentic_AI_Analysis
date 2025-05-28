@@ -9,5 +9,4 @@ plotly
 seaborn
 matplotlib
 sqlalchemy
-sqlite3
 streamlit
