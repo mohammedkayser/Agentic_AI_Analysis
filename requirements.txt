@@ -1,0 +1,13 @@
+langchain
+langchain-google-genai
+langchain-experimental
+langchain-community
+pandas
+python-dotenv
+jupyter
+plotly
+seaborn
+matplotlib
+sqlalchemy
+sqlite3
+streamlit
