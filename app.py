@@ -1,5 +1,4 @@
-# Final output polish: force model to provide answer inline and NOT refer to 'table above'
-# Fix LLM markdown table formatting for parsing errors
+# Full app.py with table length limit and safer parsing
 
 import streamlit as st
 import pandas as pd
@@ -102,7 +101,7 @@ class DataAnalysisApp:
         You are a helpful data analyst AI. Format structured data as markdown tables using |.
         Do NOT use triple backticks (```) around tables.
         Always respond inline with results. Do not say "see table above".
-        Provide interpretation after the table.
+        Limit results to 30 rows max. Provide interpretation after the table.
 
         Database schema:
         {schema}
@@ -124,7 +123,7 @@ class DataAnalysisApp:
         return (
             question.strip()
             + "\n\nPlease format your answer as a markdown table (without code block)."
-            + " Do not refer to tables above. Provide your insights inline."
+            + " Limit rows to 30 max. Do not refer to tables above. Provide insights inline."
         )
 
     def format_response(self, response):
@@ -137,8 +136,10 @@ class DataAnalysisApp:
                 table_text = "\n".join(lines[start:end+1])
                 df = pd.read_csv(io.StringIO(table_text), sep="|", engine="python")
                 df = df.dropna(axis=1, how='all')
+                if len(df) > 30:
+                    df = df.head(30)
                 explanation = response.replace(table_text, '').strip()
-                return {"explanation": explanation, "table": df}
+                return {"explanation": explanation + "\n\n*Only first 30 rows shown*", "table": df}
         except Exception as e:
             st.warning("⚠️ Unable to parse markdown table. Showing raw text.")
         return {"explanation": response, "table": None}
