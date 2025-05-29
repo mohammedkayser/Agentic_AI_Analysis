@@ -1,4 +1,7 @@
-# app.py - Final fix for output parsing errors
+# Final output polish: force model to provide answer inline and NOT refer to 'table above'
+# Improve prompt to say: "Respond directly below. Do not say 'above' or 'as shown above'."
+
+# This version updates `enhance_question()` to insert stronger behavior guidance for clarity and inline answer formatting
 
 import streamlit as st
 import pandas as pd
@@ -11,9 +14,9 @@ import io
 
 # LangChain imports
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.agent_toolkits.sql.base import create_sql_agent
-from langchain_community.agent_toolkits.sql.toolkit import SQLDatabaseToolkit
-from langchain_community.utilities import SQLDatabase
+from langchain.agents import create_sql_agent
+from langchain.agents.agent_toolkits import SQLDatabaseToolkit
+from langchain.sql_database import SQLDatabase
 from langchain.agents.agent_types import AgentType
 
 warnings.filterwarnings("ignore")
@@ -100,7 +103,8 @@ class DataAnalysisApp:
         schema = db.get_table_info()
         prompt = f"""
         You are a helpful data analyst AI. Format structured data as markdown tables using |.
-        Add insights, summaries, and interpretations when possible.
+        Always respond inline with the results. DO NOT say "the table above" or "as shown above".
+        Provide interpretation after the table.
 
         Database schema:
         {schema}
@@ -120,7 +124,7 @@ class DataAnalysisApp:
 
     def enhance_question(self, question):
         if "table" in question.lower():
-            question += "\n\nFormat your response as a markdown table if it contains structured data."
+            question += "\n\nPlease respond directly below with a markdown table. Do not refer to tables 'above'."
         return question
 
     def format_response(self, response):
@@ -143,7 +147,7 @@ class DataAnalysisApp:
             response = agent_executor.run(enhanced)
             return self.format_response(response)
 
-# The rest of the `main()` remains the same and supports immediate question execution and chat UI
+# The rest of the code for main() remains unchanged
 
 def main():
     app = DataAnalysisApp()
