@@ -69,7 +69,7 @@ class DataAnalysisApp:
             st.error("⚠️ Please set your GOOGLE_API_KEY in the .env file")
             st.stop()
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash-lite",
+            model="gemini-1.5-flash-8b",
             google_api_key=api_key,
             temperature=0,
             convert_system_message_to_human=True
