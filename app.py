@@ -232,6 +232,75 @@ def ask_question(agent, question):
         sys.stdout = old_stdout
         return f"Error: {str(e)}"
 
+def display_formatted_response(formatted_response):
+    """Display the formatted response with tables and charts"""
+    
+    # Display summary text
+    if formatted_response["text"]:
+        st.markdown(formatted_response["text"])
+    
+    # Display table if available
+    if formatted_response["table"] is not None:
+        st.subheader("📊 Detailed Data")
+        
+        # Display regular table
+        st.dataframe(
+            formatted_response["table"], 
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        # Display pivot table if available
+        if "pivot_table" in formatted_response and formatted_response["pivot_table"] is not None:
+            st.subheader("📋 Pivot Summary")
+            st.dataframe(formatted_response["pivot_table"], use_container_width=True)
+        
+        # Create visualizations
+        df = formatted_response["table"]
+        
+        if len(df.columns) >= 2:
+            # Create appropriate chart based on data structure
+            if 'Gender' in df.columns and 'Age Group' in df.columns and 'Average Balance' in df.columns:
+                # Multi-dimensional data - create grouped bar chart
+                fig = px.bar(
+                    df, 
+                    x='Age Group', 
+                    y='Average Balance',
+                    color='Gender',
+                    facet_col='Job Classification' if 'Job Classification' in df.columns else None,
+                    title='Average Balance by Demographics',
+                    labels={'Average Balance': 'Average Balance ($)'}
+                )
+                fig.update_layout(height=500)
+                st.plotly_chart(fig, use_container_width=True)
+                
+            elif len(df.columns) == 2:
+                # Simple two-column data
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Bar chart
+                    fig_bar = px.bar(
+                        df, 
+                        x='Category', 
+                        y='Value',
+                        title='Bar Chart View'
+                    )
+                    fig_bar.update_layout(height=400)
+                    st.plotly_chart(fig_bar, use_container_width=True)
+                
+                with col2:
+                    # Pie chart
+                    if df['Value'].min() >= 0:  # Only for non-negative values
+                        fig_pie = px.pie(
+                            df, 
+                            values='Value', 
+                            names='Category',
+                            title='Distribution View'
+                        )
+                        fig_pie.update_layout(height=400)
+                        st.plotly_chart(fig_pie, use_container_width=True)
+
 # Main app
 def main():
     st.markdown('<h1 class="main-header">💬 Chat with Your Data</h1>', unsafe_allow_html=True)
