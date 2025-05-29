@@ -1,4 +1,4 @@
-# Full app.py with table length limit and safer parsing
+# Full app.py with OutputFixingParser correctly instantiated
 
 import streamlit as st
 import pandas as pd
@@ -14,6 +14,7 @@ from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain.sql_database import SQLDatabase
 from langchain.agents.agent_types import AgentType
+from langchain.output_parsers import OutputFixingParser, StrOutputParser
 
 warnings.filterwarnings("ignore")
 
@@ -107,12 +108,14 @@ class DataAnalysisApp:
         {schema}
         """
         toolkit = SQLDatabaseToolkit(db=db, llm=self.llm)
+        output_parser = OutputFixingParser.from_llm(parser=StrOutputParser(), llm=self.llm)
         return create_sql_agent(
             llm=self.llm,
             toolkit=toolkit,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             verbose=True,
             handle_parsing_errors=True,
+            output_parser=output_parser,
             max_iterations=20,
             max_execution_time=60,
             early_stopping_method="force",
@@ -149,6 +152,7 @@ class DataAnalysisApp:
             enhanced = self.enhance_question(question)
             response = agent_executor.run(enhanced)
             return self.format_response(response)
+
 
 
 # The rest of the code for main() remains unchanged
