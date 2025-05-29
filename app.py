@@ -15,6 +15,9 @@ from langchain.agents.agent_types import AgentType
 import tempfile
 import io
 import sys
+import re
+import plotly.express as px
+import plotly.graph_objects as go
 
 # Page configuration
 st.set_page_config(
@@ -125,6 +128,91 @@ def setup_database_and_agent(df, api_key):
     except Exception as e:
         st.error(f"Error setting up database and agent: {str(e)}")
         return None, None
+
+def parse_and_format_response(response):
+    """Parse AI response and format it properly with tables and visualizations"""
+    
+    # Check if response contains structured data patterns
+    patterns = {
+        'gender_age_job': r'(Male|Female),\s*([\w-]+),\s*([\w\s]+):\s*([\d.]+)',
+        'gender_balance': r'(Male|Female).*?(\d+\.?\d*)',
+        'age_group': r'([\d-]+|\d+\+).*?(\d+\.?\d*)',
+        'region_data': r'([A-Za-z\s]+).*?(\d+\.?\d*)',
+        'job_classification': r'([A-Za-z\s]+Collar|Other).*?(\d+\.?\d*)'
+    }
+    
+    formatted_response = {"text": response, "table": None, "chart": None}
+    
+    # Try to extract structured data
+    for pattern_name, pattern in patterns.items():
+        matches = re.findall(pattern, response, re.IGNORECASE)
+        
+        if matches and len(matches) > 3:  # Only process if we have meaningful data
+            if pattern_name == 'gender_age_job':
+                # Parse gender, age group, job classification data
+                data = []
+                for match in matches:
+                    data.append({
+                        'Gender': match[0],
+                        'Age Group': match[1],
+                        'Job Classification': match[2].strip(),
+                        'Average Balance': float(match[3])
+                    })
+                
+                df = pd.DataFrame(data)
+                formatted_response["table"] = df
+                
+                # Create pivot table for better visualization
+                if len(df) > 0:
+                    pivot_df = df.pivot_table(
+                        values='Average Balance', 
+                        index=['Gender', 'Age Group'], 
+                        columns='Job Classification',
+                        aggfunc='mean'
+                    ).round(2)
+                    formatted_response["pivot_table"] = pivot_df
+                
+                # Generate summary text
+                avg_by_gender = df.groupby('Gender')['Average Balance'].mean()
+                summary = f"\n\n**Summary:**\n"
+                summary += f"• Overall, {'Female' if avg_by_gender.get('Female', 0) > avg_by_gender.get('Male', 0) else 'Male'} customers have a higher average balance\n"
+                summary += f"• Female average: ${avg_by_gender.get('Female', 0):,.2f}\n"
+                summary += f"• Male average: ${avg_by_gender.get('Male', 0):,.2f}\n"
+                
+                highest_combo = df.loc[df['Average Balance'].idxmax()]
+                summary += f"• Highest balance combination: {highest_combo['Gender']} {highest_combo['Age Group']} {highest_combo['Job Classification']} (${highest_combo['Average Balance']:,.2f})"
+                
+                formatted_response["text"] = summary
+                break
+                
+            elif pattern_name in ['gender_balance', 'age_group', 'region_data', 'job_classification']:
+                # Parse simpler two-column data
+                data = []
+                for match in matches:
+                    data.append({
+                        'Category': match[0].strip(),
+                        'Value': float(match[1])
+                    })
+                
+                df = pd.DataFrame(data)
+                if len(df) > 0:
+                    formatted_response["table"] = df
+                    
+                    # Generate summary
+                    total = df['Value'].sum()
+                    highest = df.loc[df['Value'].idxmax()]
+                    lowest = df.loc[df['Value'].idxmin()]
+                    
+                    summary = f"\n\n**Summary:**\n"
+                    summary += f"• Total: {total:,.2f}\n"
+                    summary += f"• Highest: {highest['Category']} ({highest['Value']:,.2f})\n"
+                    summary += f"• Lowest: {lowest['Category']} ({lowest['Value']:,.2f})\n"
+                    summary += f"• Average: {df['Value'].mean():,.2f}"
+                    
+                    formatted_response["text"] = summary
+                break
+    
+    return formatted_response
 
 def ask_question(agent, question):
     """Ask a question to the AI agent"""
@@ -242,8 +330,13 @@ def main():
                 st.markdown(f'<div class="chat-message user-message"><strong>You:</strong> {message["content"]}</div>', 
                            unsafe_allow_html=True)
             else:
-                st.markdown(f'<div class="chat-message bot-message"><strong>AI:</strong> {message["content"]}</div>', 
+                st.markdown('<div class="chat-message bot-message"><strong>AI:</strong></div>', 
                            unsafe_allow_html=True)
+                # Handle both old string responses and new formatted responses
+                if isinstance(message["content"], dict):
+                    display_formatted_response(message["content"])
+                else:
+                    st.markdown(message["content"])
     
     # Chat input
     question = st.chat_input("Ask a question about your data...")
@@ -261,13 +354,17 @@ def main():
         with st.spinner("🤔 Thinking..."):
             response = ask_question(st.session_state.agent, question)
         
-        # Add AI response to chat history
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        # Format the response
+        formatted_response = parse_and_format_response(response)
         
-        # Display AI response
+        # Add AI response to chat history
+        st.session_state.messages.append({"role": "assistant", "content": formatted_response})
+        
+        # Display AI response with proper formatting
         with st.container():
-            st.markdown(f'<div class="chat-message bot-message"><strong>AI:</strong> {response}</div>', 
+            st.markdown('<div class="chat-message bot-message"><strong>AI:</strong></div>', 
                        unsafe_allow_html=True)
+            display_formatted_response(formatted_response)
         
         # Rerun to update the display
         st.rerun()
