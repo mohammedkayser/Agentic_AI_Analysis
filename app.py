@@ -1,4 +1,4 @@
-# Full app.py with table length limit and safer parsing
+# Full app.py with OutputFixingParser to handle malformed markdown tables
 
 import streamlit as st
 import pandas as pd
@@ -14,6 +14,7 @@ from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain.sql_database import SQLDatabase
 from langchain.agents.agent_types import AgentType
+from langchain.output_parsers import OutputFixingParser
 
 warnings.filterwarnings("ignore")
 
@@ -113,6 +114,7 @@ class DataAnalysisApp:
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             verbose=True,
             handle_parsing_errors=True,
+            output_parser=OutputFixingParser.from_llm(self.llm),
             max_iterations=20,
             max_execution_time=60,
             early_stopping_method="force",
