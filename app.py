@@ -1,7 +1,5 @@
 # Final output polish: force model to provide answer inline and NOT refer to 'table above'
-# Improve prompt to say: "Respond directly below. Do not say 'above' or 'as shown above'."
-
-# This version updates `enhance_question()` to insert stronger behavior guidance for clarity and inline answer formatting
+# Fix LLM markdown table formatting for parsing errors
 
 import streamlit as st
 import pandas as pd
@@ -12,7 +10,6 @@ import warnings
 from dotenv import load_dotenv
 import io
 
-# LangChain imports
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
@@ -103,7 +100,8 @@ class DataAnalysisApp:
         schema = db.get_table_info()
         prompt = f"""
         You are a helpful data analyst AI. Format structured data as markdown tables using |.
-        Always respond inline with the results. DO NOT say "the table above" or "as shown above".
+        Do NOT use triple backticks (```) around tables.
+        Always respond inline with results. Do not say "see table above".
         Provide interpretation after the table.
 
         Database schema:
@@ -123,22 +121,26 @@ class DataAnalysisApp:
         ), db
 
     def enhance_question(self, question):
-        if "table" in question.lower():
-            question += "\n\nPlease respond directly below with a markdown table. Do not refer to tables 'above'."
-        return question
+        return (
+            question.strip()
+            + "\n\nPlease format your answer as a markdown table (without code block)."
+            + " Do not refer to tables above. Provide your insights inline."
+        )
 
     def format_response(self, response):
         try:
             lines = response.strip().split("\n")
             table_lines = [l for l in lines if "|" in l and len(l.strip()) > 5]
             if len(table_lines) >= 2 and any("---" in l for l in table_lines):
-                table_text = "\n".join(table_lines)
+                start = lines.index(next(l for l in table_lines if "---" in l)) - 1
+                end = start + 1 + sum(1 for l in table_lines if l != table_lines[0])
+                table_text = "\n".join(lines[start:end+1])
                 df = pd.read_csv(io.StringIO(table_text), sep="|", engine="python")
                 df = df.dropna(axis=1, how='all')
                 explanation = response.replace(table_text, '').strip()
                 return {"explanation": explanation, "table": df}
         except Exception as e:
-            st.warning("⚠️ Unable to parse structured output. Displaying raw text.")
+            st.warning("⚠️ Unable to parse markdown table. Showing raw text.")
         return {"explanation": response, "table": None}
 
     def ask_question(self, question, agent_executor):
@@ -146,6 +148,7 @@ class DataAnalysisApp:
             enhanced = self.enhance_question(question)
             response = agent_executor.run(enhanced)
             return self.format_response(response)
+
 
 # The rest of the code for main() remains unchanged
 
