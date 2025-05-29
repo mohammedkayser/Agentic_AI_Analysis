@@ -1,4 +1,5 @@
-# Full app.py with OutputFixingParser correctly instantiated
+# Final output polish: force model to provide answer inline and NOT refer to 'table above'
+# Fix LLM markdown table formatting for parsing errors
 
 import streamlit as st
 import pandas as pd
@@ -14,7 +15,6 @@ from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain.sql_database import SQLDatabase
 from langchain.agents.agent_types import AgentType
-from langchain.output_parsers import OutputFixingParser, StrOutputParser
 
 warnings.filterwarnings("ignore")
 
@@ -102,20 +102,18 @@ class DataAnalysisApp:
         You are a helpful data analyst AI. Format structured data as markdown tables using |.
         Do NOT use triple backticks (```) around tables.
         Always respond inline with results. Do not say "see table above".
-        Limit results to 30 rows max. Provide interpretation after the table.
+        Provide interpretation after the table.
 
         Database schema:
         {schema}
         """
         toolkit = SQLDatabaseToolkit(db=db, llm=self.llm)
-        output_parser = OutputFixingParser.from_llm(parser=StrOutputParser(), llm=self.llm)
         return create_sql_agent(
             llm=self.llm,
             toolkit=toolkit,
             agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
             verbose=True,
             handle_parsing_errors=True,
-            output_parser=output_parser,
             max_iterations=20,
             max_execution_time=60,
             early_stopping_method="force",
@@ -126,7 +124,7 @@ class DataAnalysisApp:
         return (
             question.strip()
             + "\n\nPlease format your answer as a markdown table (without code block)."
-            + " Limit rows to 30 max. Do not refer to tables above. Provide insights inline."
+            + " Do not refer to tables above. Provide your insights inline."
         )
 
     def format_response(self, response):
@@ -139,10 +137,8 @@ class DataAnalysisApp:
                 table_text = "\n".join(lines[start:end+1])
                 df = pd.read_csv(io.StringIO(table_text), sep="|", engine="python")
                 df = df.dropna(axis=1, how='all')
-                if len(df) > 30:
-                    df = df.head(30)
                 explanation = response.replace(table_text, '').strip()
-                return {"explanation": explanation + "\n\n*Only first 30 rows shown*", "table": df}
+                return {"explanation": explanation, "table": df}
         except Exception as e:
             st.warning("⚠️ Unable to parse markdown table. Showing raw text.")
         return {"explanation": response, "table": None}
@@ -152,7 +148,6 @@ class DataAnalysisApp:
             enhanced = self.enhance_question(question)
             response = agent_executor.run(enhanced)
             return self.format_response(response)
-
 
 
 # The rest of the code for main() remains unchanged
