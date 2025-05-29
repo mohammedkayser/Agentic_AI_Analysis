@@ -266,7 +266,7 @@ class DataAnalysisApp:
             st.stop()
 
     def preprocess_data(self, df):
-        """Clean and preprocess the uploaded data"""
+        """Clean and preprocess the uploaded data with fixed categorical handling"""
         try:
             # Clean column names
             original_columns = df.columns.tolist()
@@ -293,6 +293,13 @@ class DataAnalysisApp:
             
             df.columns = new_cols
             
+            # Handle missing values BEFORE creating categorical columns
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    df[col] = df[col].fillna('NULL')
+                elif df[col].dtype in ['int64', 'float64']:
+                    df[col] = df[col].fillna(0)
+            
             # Handle date columns
             date_keywords = ['date', 'time', 'created', 'updated', 'joined']
             for col in df.columns:
@@ -302,7 +309,7 @@ class DataAnalysisApp:
                     except:
                         continue
             
-            # Create age groups if age column exists
+            # Create age groups if age column exists (AFTER handling missing values)
             age_col = None
             for col in df.columns:
                 if 'age' in col.lower():
@@ -311,21 +318,34 @@ class DataAnalysisApp:
             
             if age_col and df[age_col].dtype in ['int64', 'float64']:
                 try:
+                    # Ensure no missing values in age column before creating categories
+                    df[age_col] = df[age_col].fillna(0)  # Fill any remaining NaN values
+                    
+                    # Create age groups with proper handling of edge cases
                     df['age_group'] = pd.cut(
                         df[age_col], 
                         bins=[0, 25, 35, 50, 65, 100], 
                         labels=['18-25', '26-35', '36-50', '51-65', '65+'],
-                        include_lowest=True
+                        include_lowest=True,
+                        right=True  # Include right boundary
                     )
-                except:
+                    
+                    # Handle any remaining NaN in age_group (for ages outside bins)
+                    df['age_group'] = df['age_group'].cat.add_categories(['Unknown'])
+                    df['age_group'] = df['age_group'].fillna('Unknown')
+                    
+                except Exception as e:
+                    st.warning(f"Could not create age groups: {str(e)}")
                     pass
             
-            # Handle missing values more carefully
+            # Final pass to handle any remaining categorical columns with missing values
             for col in df.columns:
-                if df[col].dtype == 'object':
-                    df[col] = df[col].fillna('NULL')
-                else:
-                    df[col] = df[col].fillna(0)
+                if pd.api.types.is_categorical_dtype(df[col]):
+                    # For categorical columns, add 'NULL' as a category if needed
+                    if df[col].isnull().any():
+                        if 'NULL' not in df[col].cat.categories:
+                            df[col] = df[col].cat.add_categories(['NULL'])
+                        df[col] = df[col].fillna('NULL')
             
             # Log column mapping for debugging
             if len(original_columns) != len(df.columns):
@@ -335,7 +355,18 @@ class DataAnalysisApp:
             
         except Exception as e:
             st.error(f"❌ Error preprocessing data: {str(e)}")
-            return df
+            # Return original dataframe with minimal processing if preprocessing fails
+            try:
+                # Just handle missing values without complex transformations
+                df_simple = df.copy()
+                for col in df_simple.columns:
+                    if df_simple[col].dtype == 'object':
+                        df_simple[col] = df_simple[col].fillna('NULL')
+                    else:
+                        df_simple[col] = df_simple[col].fillna(0)
+                return df_simple
+            except:
+                return df
 
     def create_agent(self, db_path):
         """Create SQL agent with improved connection handling"""
@@ -737,204 +768,262 @@ def main():
     except Exception as e:
         st.error(f"❌ Failed to initialize app: {str(e)}")
         st.stop()
+
+    # Main header
+    st.markdown('<div class="main-header">🤖 Agentic Data Analysis Chat</div>', unsafe_allow_html=True)
     
-    # Header
-    st.markdown('<h1 class="main-header">🤖 Agentic Data Analysis Chat</h1>', unsafe_allow_html=True)
-    
-    # Sidebar for file upload
+    # Sidebar for file upload and information
     with st.sidebar:
-        st.header("📊 Data Upload")
+        st.header("📁 Data Upload")
         
+        # File upload
         uploaded_file = st.file_uploader(
-            "Choose a CSV file",
-            type=['csv'],
-            help="Upload a CSV file to start analyzing your data"
+            "Upload your dataset",
+            type=['csv', 'xlsx', 'xls'],
+            help="Upload a CSV or Excel file to start analyzing"
         )
         
-        if uploaded_file is not None:
+        # Process uploaded file
+        if uploaded_file is not None and not st.session_state.data_uploaded:
             try:
-                # Load data with error handling
-                try:
-                    df = pd.read_csv(uploaded_file)
-                except Exception as e:
-                    st.error(f"❌ Error reading CSV: {str(e)}")
-                    st.stop()
-                
-                if df.empty:
-                    st.error("❌ The uploaded file is empty")
-                    st.stop()
-                
-                # Preprocess data
-                with st.spinner("Processing data..."):
-                    df = app.preprocess_data(df)
-                    db_path = app.db_manager.create_database(df)
+                with st.spinner("📊 Processing your data..."):
+                    # Read file based on extension
+                    if uploaded_file.name.endswith('.csv'):
+                        df = pd.read_csv(uploaded_file)
+                    else:
+                        df = pd.read_excel(uploaded_file)
+                    
+                    # Validate data
+                    if df.empty:
+                        st.error("❌ The uploaded file is empty")
+                        st.stop()
+                    
+                    if len(df.columns) == 0:
+                        st.error("❌ No columns found in the file")
+                        st.stop()
+                    
+                    # Preprocess data
+                    df_processed = app.preprocess_data(df)
+                    
+                    # Create database
+                    db_path = app.db_manager.create_database(df_processed)
                     
                     if db_path:
-                        agent_executor, db = app.create_agent(db_path)
+                        # Create agent
+                        agent_executor, sql_db = app.create_agent(db_path)
                         
                         if agent_executor:
-                            # Update session state
-                            st.session_state.update({
-                                'df': df,
-                                'db_path': db_path,
-                                'agent_executor': agent_executor,
-                                'sql_database': db,
-                                'data_uploaded': True,
-                                'last_error': None
-                            })
+                            # Store in session state
+                            st.session_state.df = df_processed
+                            st.session_state.db_path = db_path
+                            st.session_state.agent_executor = agent_executor
+                            st.session_state.sql_database = sql_db
+                            st.session_state.data_uploaded = True
                             
-                            st.success("✅ Data uploaded and processed successfully!")
+                            st.success(f"✅ Data loaded successfully! {len(df_processed):,} rows, {len(df_processed.columns)} columns")
+                            st.rerun()
                         else:
                             st.error("❌ Failed to create analysis agent")
                     else:
                         st.error("❌ Failed to create database")
-                
-                # Show data info
-                if st.session_state.data_uploaded:
-                    st.markdown('<div class="sidebar-info">', unsafe_allow_html=True)
-                    st.write("**Dataset Info:**")
-                    st.write(f"- **Rows:** {df.shape[0]:,}")
-                    st.write(f"- **Columns:** {df.shape[1]}")
-                    st.write(f"- **Size:** {df.memory_usage().sum() / 1024:.1f} KB")
-                    st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    # Expandable sections
-                    with st.expander("📋 View Columns"):
-                        st.write(list(df.columns))
-                    
-                    with st.expander("👀 Sample Data"):
-                        st.dataframe(df.head())
-                    
-                    with st.expander("📈 Quick Stats"):
-                        st.write(df.describe())
-                
+                        
             except Exception as e:
                 st.error(f"❌ Error processing file: {str(e)}")
                 st.session_state.data_uploaded = False
         
-        # Sample questions
-        if st.session_state.data_uploaded:
-            st.markdown("---")
-            st.header("💡 Quick Analysis")
+        # Show data information if uploaded
+        if st.session_state.data_uploaded and st.session_state.df is not None:
+            st.markdown('<div class="sidebar-info">', unsafe_allow_html=True)
+            st.markdown("### 📊 Dataset Info")
+            df = st.session_state.df
             
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Rows", f"{len(df):,}")
+                st.metric("Numeric Cols", len(df.select_dtypes(include=['number']).columns))
+            
+            with col2:
+                st.metric("Columns", len(df.columns))
+                st.metric("Text Cols", len(df.select_dtypes(include=['object']).columns))
+            
+            # Show column names
+            with st.expander("📋 Column Names"):
+                for i, col in enumerate(df.columns, 1):
+                    st.write(f"{i}. {col}")
+            
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Reset button
+            if st.button("🔄 Upload New Data", type="secondary"):
+                # Clean up
+                if st.session_state.db_path and os.path.exists(st.session_state.db_path):
+                    try:
+                        os.unlink(st.session_state.db_path)
+                    except:
+                        pass
+                
+                # Reset session state
+                for key in ['df', 'db_path', 'agent_executor', 'sql_database', 'data_uploaded', 'messages', 'analysis_cache']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                
+                st.rerun()
+        
+        # Usage tips
+        if not st.session_state.data_uploaded:
+            st.markdown("### 💡 Tips")
+            st.markdown("""
+            - Upload CSV or Excel files
+            - Ensure data has column headers
+            - Files up to 200MB supported
+            - Clean data works best
+            """)
+        
+        else:
+            st.markdown("### 💬 Sample Questions")
             sample_questions = [
-                "Show me data overview and patterns",
-                "What columns do I have?",
-                "Give me basic statistics",
-                "Show missing data information",
-                "What are the top categories?",
-                "Display summary statistics table"
+                "Show me a summary of the data",
+                "What are the column names and types?",
+                "Show me the top 10 records",
+                "What patterns do you see?",
+                "Are there any missing values?",
+                "Show statistics for numeric columns"
             ]
             
-            for question in sample_questions:
-                if st.button(question, key=f"sample_{question}", use_container_width=True):
-                    st.session_state.messages.append({"role": "user", "content": question})
-                    # Process immediately
-                    with st.spinner("Processing..."):
+            for q in sample_questions:
+                if st.button(q, key=f"sample_{hash(q)}", use_container_width=True):
+                    st.session_state.messages.append({"role": "user", "content": q})
+                    st.rerun()
+
+    # Main chat interface
+    if st.session_state.data_uploaded:
+        # Chat container
+        chat_container = st.container()
+        
+        # Display chat messages
+        with chat_container:
+            for i, message in enumerate(st.session_state.messages):
+                if message["role"] == "user":
+                    st.markdown(f"""
+                    <div class="chat-message user-message">
+                        <strong>🧑‍💼 You:</strong> {message["content"]}
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div class="chat-message assistant-message">
+                        <strong>🤖 Assistant:</strong>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    st.markdown(message["content"])
+        
+        # Chat input
+        st.markdown("---")
+        
+        # Question input
+        question = st.chat_input("Ask a question about your data...")
+        
+        if question:
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": question})
+            
+            # Process question
+            try:
+                with st.spinner("🤖 Analyzing your data..."):
+                    if st.session_state.agent_executor and st.session_state.df is not None:
                         response = app.ask_question_with_retry(
                             question, 
                             st.session_state.agent_executor, 
                             st.session_state.df
                         )
+                        
+                        # Add assistant response
                         st.session_state.messages.append({"role": "assistant", "content": response})
-                    st.rerun()
-
-    # Main chat interface
-    if not st.session_state.data_uploaded:
-        st.info("👆 Please upload a CSV file in the sidebar to start analyzing")
+                    else:
+                        st.error("❌ Analysis agent not available. Please reload your data.")
+                        
+            except Exception as e:
+                error_msg = f"❌ Error processing question: {str(e)}"
+                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                st.error(error_msg)
+            
+            st.rerun()
         
-        # Instructions
+        # Clear chat button
+        if st.session_state.messages:
+            col1, col2, col3 = st.columns([1, 1, 1])
+            with col2:
+                if st.button("🗑️ Clear Chat", type="secondary", use_container_width=True):
+                    st.session_state.messages = []
+                    st.session_state.analysis_cache = {}
+                    st.rerun()
+    
+    else:
+        # Welcome screen
+        st.markdown("""
+        ## 👋 Welcome to Agentic Data Analysis Chat!
+        
+        ### 🚀 Getting Started:
+        1. **Upload your data** using the sidebar (CSV or Excel files)
+        2. **Ask questions** in natural language about your data
+        3. **Get insights** powered by AI analysis
+        
+        ### 🎯 What you can do:
+        - Get data summaries and overviews
+        - Analyze patterns and trends
+        - Generate statistics and visualizations
+        - Ask complex analytical questions
+        - Explore relationships in your data
+        
+        ### 📝 Example Questions:
+        - "What are the main patterns in this data?"
+        - "Show me the average values by category"
+        - "Which records have the highest values?"
+        - "Are there any data quality issues?"
+        - "What insights can you provide?"
+        
+        ### 🔧 Features:
+        - **Natural Language Processing**: Ask questions in plain English
+        - **SQL Agent**: Automated query generation and execution
+        - **Smart Caching**: Faster responses for repeated questions
+        - **Error Recovery**: Robust handling of complex queries
+        - **Data Preprocessing**: Automatic data cleaning and optimization
+        """)
+        
+        # Feature highlights
         col1, col2, col3 = st.columns(3)
         
         with col1:
             st.markdown("""
-            ### 📤 Step 1: Upload
-            - Click "Choose a CSV file" in sidebar
-            - Wait for processing to complete
-            - Check for any error messages
+            ### 🧠 AI-Powered
+            Advanced language models understand your questions and generate appropriate SQL queries automatically.
             """)
         
         with col2:
             st.markdown("""
-            ### 💬 Step 2: Ask Questions
-            - Use natural language queries
-            - Try the sample questions
-            - Ask about patterns, statistics, insights
+            ### ⚡ Fast & Efficient
+            Optimized database operations with caching for quick responses to your analytical queries.
             """)
         
         with col3:
             st.markdown("""
-            ### 📊 Step 3: Analyze
-            - Get AI-powered insights
-            - View formatted tables and charts
-            - Ask follow-up questions
+            ### 🛡️ Robust & Reliable
+            Built-in error handling, retry logic, and fallback mechanisms ensure consistent performance.
             """)
-    else:
-        # Display conversation
-        for message in st.session_state.messages:
-            if message["role"] == "user":
-                st.markdown(
-                    f'<div class="chat-message user-message"><strong>You:</strong> {message["content"]}</div>',
-                    unsafe_allow_html=True
-                )
-            else:
-                st.markdown(
-                    '<div class="chat-message assistant-message"><strong>🤖 Assistant:</strong></div>',
-                    unsafe_allow_html=True
-                )
-                st.markdown(message["content"])
-        
-        # Chat input
-        if prompt := st.chat_input("Ask me anything about your data..."):
-            if not st.session_state.processing:
-                st.session_state.processing = True
-                st.session_state.messages.append({"role": "user", "content": prompt})
-                
-                # Get response
-                try:
-                    response = app.ask_question_with_retry(
-                        prompt, 
-                        st.session_state.agent_executor, 
-                        st.session_state.df
-                    )
-                    st.session_state.messages.append({"role": "assistant", "content": response})
-                except Exception as e:
-                    error_response = f"❌ Sorry, I encountered an error: {str(e)}\n\nPlease try rephrasing your question."
-                    st.session_state.messages.append({"role": "assistant", "content": error_response})
-                
-                st.session_state.processing = False
-                st.rerun()
-        
-        # Clear chat button
-        if st.button("🗑️ Clear Chat History", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.analysis_cache = {}  # Clear cache too
-            st.rerun()
-    
-    # Database Connection Status (Debug info)
-    if st.session_state.data_uploaded:
-        with st.expander("🔧 Debug Info"):
-            st.write("**Connection Status:**")
-            if st.session_state.db_path:
-                connection_test = app.db_manager.test_connection(st.session_state.db_path)
-                if connection_test['status'] == 'success':
-                    st.success(f"✅ Database: {connection_test['rows']:,} rows, {connection_test['columns']} columns")
-                else:
-                    st.error(f"❌ Database Error: {connection_test.get('error', 'Unknown error')}")
-            
-            st.write("**Session State:**")
-            st.write(f"- Agent Executor: {'✅ Active' if st.session_state.agent_executor else '❌ None'}")
-            st.write(f"- Database Path: {'✅ Set' if st.session_state.db_path else '❌ None'}")
-            st.write(f"- Cache Size: {len(st.session_state.analysis_cache)} entries")
-    
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        '<div style="text-align: center; color: #666; font-size: 0.9em;">'
-        'Built with ❤️ using Streamlit & LangChain | Powered by Google Gemini'
-        '</div>',
-        unsafe_allow_html=True
-    )
 
+# Cleanup function
+def cleanup_resources():
+    """Clean up temporary files and connections"""
+    try:
+        if st.session_state.get('db_path') and os.path.exists(st.session_state.db_path):
+            os.unlink(st.session_state.db_path)
+    except:
+        pass
+
+# Register cleanup
+import atexit
+atexit.register(cleanup_resources)
+
+# Run the app
 if __name__ == "__main__":
     main()
