@@ -7,6 +7,7 @@ import warnings
 from dotenv import load_dotenv
 import time
 import traceback
+import threading
 
 # LangChain imports with proper error handling
 try:
@@ -88,18 +89,152 @@ def initialize_session_state():
         'data_uploaded': False,
         'processing': False,
         'last_error': None,
-        'analysis_cache': {}
+        'analysis_cache': {},
+        'db_connection': None,
+        'sql_database': None
     }
     
     for key, default_value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = default_value
 
+class DatabaseManager:
+    """Separate class to handle database connections and operations"""
+    
+    def __init__(self):
+        self.db_lock = threading.Lock()
+    
+    def create_database(self, df):
+        """Create SQLite database with improved error handling and connection management"""
+        try:
+            # Create temporary database file
+            temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+            db_path = temp_db.name
+            temp_db.close()
+            
+            # Create connection with optimized settings
+            conn = sqlite3.connect(
+                db_path, 
+                timeout=30,  # Increased timeout
+                check_same_thread=False,  # Allow multi-threading
+                isolation_level=None  # Autocommit mode
+            )
+            
+            # Set pragmas for better performance and reliability
+            conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging
+            conn.execute("PRAGMA synchronous=NORMAL")  # Balance between performance and safety
+            conn.execute("PRAGMA temp_store=MEMORY")  # Store temp tables in memory
+            conn.execute("PRAGMA cache_size=10000")  # Increase cache size
+            
+            # Prepare dataframe for SQLite
+            df_copy = df.copy()
+            
+            # Clean and standardize data types
+            for col in df_copy.columns:
+                if df_copy[col].dtype == 'object':
+                    # Convert object columns to string and handle nulls
+                    df_copy[col] = df_copy[col].astype(str).replace('nan', 'NULL')
+                elif df_copy[col].dtype in ['float64', 'int64']:
+                    # Handle numeric nulls
+                    df_copy[col] = df_copy[col].fillna(0)
+            
+            # Insert data in chunks for better memory management
+            chunk_size = 1000
+            try:
+                df_copy.to_sql(
+                    "data_table", 
+                    conn, 
+                    if_exists="replace", 
+                    index=False, 
+                    method='multi',
+                    chunksize=chunk_size
+                )
+                
+                # Verify table creation
+                cursor = conn.execute("SELECT COUNT(*) FROM data_table")
+                row_count = cursor.fetchone()[0]
+                
+                if row_count != len(df):
+                    raise Exception(f"Row count mismatch: expected {len(df)}, got {row_count}")
+                
+                # Create indexes for better query performance
+                self._create_indexes(conn, df_copy.columns)
+                
+                conn.close()
+                st.success(f"✅ Database created successfully with {row_count:,} records")
+                return db_path
+                
+            except Exception as e:
+                conn.close()
+                os.unlink(db_path)  # Clean up on failure
+                raise e
+                
+        except Exception as e:
+            st.error(f"❌ Error creating database: {str(e)}")
+            return None
+    
+    def _create_indexes(self, conn, columns):
+        """Create indexes on commonly queried columns"""
+        try:
+            # Create indexes on likely key columns
+            index_keywords = ['id', 'name', 'date', 'time', 'gender', 'age', 'job', 'classification']
+            
+            for col in columns:
+                col_lower = col.lower()
+                if any(keyword in col_lower for keyword in index_keywords):
+                    try:
+                        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{col} ON data_table({col})")
+                    except:
+                        pass  # Skip if index creation fails
+        except Exception as e:
+            st.warning(f"⚠️ Warning: Could not create indexes: {str(e)}")
+
+    def test_connection(self, db_path):
+        """Test database connection and return connection info"""
+        try:
+            with self.db_lock:
+                conn = sqlite3.connect(
+                    db_path, 
+                    timeout=10,
+                    check_same_thread=False
+                )
+                
+                # Test basic operations
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = cursor.fetchall()
+                
+                if not tables:
+                    raise Exception("No tables found in database")
+                
+                # Get table info
+                cursor = conn.execute("PRAGMA table_info(data_table)")
+                columns = cursor.fetchall()
+                
+                # Test sample query
+                cursor = conn.execute("SELECT COUNT(*) FROM data_table LIMIT 1")
+                count = cursor.fetchone()[0]
+                
+                conn.close()
+                
+                return {
+                    'status': 'success',
+                    'tables': len(tables),
+                    'columns': len(columns),
+                    'rows': count
+                }
+                
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e)
+            }
+
 class DataAnalysisApp:
     def __init__(self):
         self.llm = None
         self.max_retries = 3
         self.timeout_seconds = 30
+        self.db_manager = DatabaseManager()
         load_dotenv()
         self.setup_api()
 
@@ -113,10 +248,10 @@ class DataAnalysisApp:
                 st.stop()
                 
             self.llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",  # Using more stable model
+                model="gemini-1.5-flash",
                 google_api_key=api_key,
-                temperature=0.1,  # Slightly higher for better responses
-                max_tokens=2048,  # Limit token count
+                temperature=0.1,
+                max_tokens=2048,
                 timeout=self.timeout_seconds
             )
             
@@ -134,10 +269,29 @@ class DataAnalysisApp:
         """Clean and preprocess the uploaded data"""
         try:
             # Clean column names
+            original_columns = df.columns.tolist()
             df.columns = [str(col).strip().replace(" ", "_").replace("-", "_").lower() for col in df.columns]
             
             # Remove special characters from column names
             df.columns = [''.join(c for c in col if c.isalnum() or c == '_') for col in df.columns]
+            
+            # Handle duplicate column names
+            seen_cols = set()
+            new_cols = []
+            for col in df.columns:
+                if col in seen_cols:
+                    counter = 1
+                    new_col = f"{col}_{counter}"
+                    while new_col in seen_cols:
+                        counter += 1
+                        new_col = f"{col}_{counter}"
+                    new_cols.append(new_col)
+                    seen_cols.add(new_col)
+                else:
+                    new_cols.append(col)
+                    seen_cols.add(col)
+            
+            df.columns = new_cols
             
             # Handle date columns
             date_keywords = ['date', 'time', 'created', 'updated', 'joined']
@@ -149,10 +303,16 @@ class DataAnalysisApp:
                         continue
             
             # Create age groups if age column exists
-            if 'age' in df.columns and df['age'].dtype in ['int64', 'float64']:
+            age_col = None
+            for col in df.columns:
+                if 'age' in col.lower():
+                    age_col = col
+                    break
+            
+            if age_col and df[age_col].dtype in ['int64', 'float64']:
                 try:
                     df['age_group'] = pd.cut(
-                        df['age'], 
+                        df[age_col], 
                         bins=[0, 25, 35, 50, 65, 100], 
                         labels=['18-25', '26-35', '36-50', '51-65', '65+'],
                         include_lowest=True
@@ -160,8 +320,16 @@ class DataAnalysisApp:
                 except:
                     pass
             
-            # Handle missing values
-            df = df.fillna('NULL')  # Replace NaN with 'NULL' for SQL compatibility
+            # Handle missing values more carefully
+            for col in df.columns:
+                if df[col].dtype == 'object':
+                    df[col] = df[col].fillna('NULL')
+                else:
+                    df[col] = df[col].fillna(0)
+            
+            # Log column mapping for debugging
+            if len(original_columns) != len(df.columns):
+                st.info(f"Column names were cleaned. Original: {len(original_columns)}, New: {len(df.columns)}")
             
             return df
             
@@ -169,49 +337,52 @@ class DataAnalysisApp:
             st.error(f"❌ Error preprocessing data: {str(e)}")
             return df
 
-    def create_database(self, df):
-        """Create SQLite database with error handling"""
-        try:
-            # Create temporary database
-            temp_db = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
-            db_path = temp_db.name
-            temp_db.close()
-            
-            # Connect and create table
-            conn = sqlite3.connect(db_path, timeout=10)
-            
-            # Ensure proper data types for SQLite
-            df_copy = df.copy()
-            for col in df_copy.columns:
-                if df_copy[col].dtype == 'object':
-                    df_copy[col] = df_copy[col].astype(str)
-            
-            df_copy.to_sql("data_table", conn, if_exists="replace", index=False, method='multi')
-            conn.commit()
-            conn.close()
-            
-            return db_path
-            
-        except Exception as e:
-            st.error(f"❌ Error creating database: {str(e)}")
-            return None
-
     def create_agent(self, db_path):
-        """Create SQL agent with optimized settings"""
+        """Create SQL agent with improved connection handling"""
         try:
-            # Create database connection
-            db = SQLDatabase.from_uri(f"sqlite:///{db_path}")
-            
-            # Test database connection
-            try:
-                schema_info = db.get_table_info()
-                if not schema_info:
-                    raise Exception("Empty schema")
-            except Exception as e:
-                st.error(f"❌ Database connection failed: {str(e)}")
+            # Test database connection first
+            connection_test = self.db_manager.test_connection(db_path)
+            if connection_test['status'] != 'success':
+                st.error(f"❌ Database connection test failed: {connection_test.get('error', 'Unknown error')}")
                 return None, None
             
-            # Create optimized system prompt
+            st.success(f"✅ Database connection verified: {connection_test['rows']:,} rows, {connection_test['columns']} columns")
+            
+            # Create database connection with retry logic
+            max_connection_retries = 3
+            db = None
+            
+            for attempt in range(max_connection_retries):
+                try:
+                    # Create SQLDatabase with proper URI
+                    db_uri = f"sqlite:///{db_path}"
+                    db = SQLDatabase.from_uri(
+                        db_uri,
+                        sample_rows_in_table_info=3,  # Limit sample rows for performance
+                        include_tables=['data_table']  # Explicitly specify table
+                    )
+                    
+                    # Test the connection
+                    schema_info = db.get_table_info()
+                    if not schema_info:
+                        raise Exception("Empty schema information")
+                    
+                    # Test a simple query
+                    test_query = "SELECT COUNT(*) FROM data_table LIMIT 1"
+                    result = db.run(test_query)
+                    
+                    st.success(f"✅ SQLDatabase connection established successfully")
+                    break
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ Database connection attempt {attempt + 1} failed: {str(e)}")
+                    if attempt == max_connection_retries - 1:
+                        st.error("❌ Failed to establish database connection after multiple attempts")
+                        return None, None
+                    time.sleep(1)
+            
+            # Create enhanced system prompt
+            schema_info = db.get_table_info()
             system_prompt = f"""
 You are an expert data analyst. Follow these rules strictly:
 
@@ -220,40 +391,53 @@ You are an expert data analyst. Follow these rules strictly:
 3. **FORMAT TABLES**: Use markdown table format with | separators
 4. **HANDLE ERRORS**: If a query fails, try a simpler version
 5. **BE SPECIFIC**: Focus on the exact question asked
+6. **GROUP BY RULES**: When using GROUP BY, include all non-aggregate columns in GROUP BY clause
 
 Database Schema:
 {schema_info}
 
 Available table: data_table
 
-Example response format:
-| Column | Value | Count |
-|--------|-------|-------|
-| Item1  | 100   | 25%   |
+Example queries:
+- Simple count: SELECT column, COUNT(*) FROM data_table GROUP BY column LIMIT 10
+- Average by group: SELECT group_col, AVG(numeric_col) FROM data_table GROUP BY group_col LIMIT 10
+- Multiple groups: SELECT col1, col2, AVG(value) FROM data_table GROUP BY col1, col2 LIMIT 10
 
 Always provide brief insights after showing data.
 """
             
-            # Create toolkit
-            toolkit = SQLDatabaseToolkit(db=db, llm=self.llm)
+            # Create toolkit with error handling
+            try:
+                toolkit = SQLDatabaseToolkit(db=db, llm=self.llm)
+            except Exception as e:
+                st.error(f"❌ Error creating SQL toolkit: {str(e)}")
+                return None, None
             
             # Create agent with conservative settings
-            agent = create_sql_agent(
-                llm=self.llm,
-                toolkit=toolkit,
-                agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-                verbose=False,  # Reduce noise
-                handle_parsing_errors=True,
-                max_iterations=3,  # Reduced iterations
-                max_execution_time=25,  # Shorter timeout
-                early_stopping_method="generate",
-                prefix=system_prompt
-            )
-            
-            return agent, db
-            
+            try:
+                agent = create_sql_agent(
+                    llm=self.llm,
+                    toolkit=toolkit,
+                    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+                    verbose=False,
+                    handle_parsing_errors=True,
+                    max_iterations=5,  # Slightly increased for complex queries
+                    max_execution_time=30,
+                    early_stopping_method="generate",
+                    prefix=system_prompt,
+                    return_intermediate_steps=False  # Reduce noise
+                )
+                
+                st.success("✅ SQL Agent created successfully")
+                return agent, db
+                
+            except Exception as e:
+                st.error(f"❌ Error creating SQL agent: {str(e)}")
+                return None, None
+                
         except Exception as e:
-            st.error(f"❌ Error creating agent: {str(e)}")
+            st.error(f"❌ Error in create_agent: {str(e)}")
+            st.error(f"Traceback: {traceback.format_exc()}")
             return None, None
 
     def direct_analysis(self, question, df):
@@ -415,7 +599,7 @@ Always provide brief insights after showing data.
             return f"❌ Error analyzing missing data: {str(e)}"
 
     def ask_question_with_retry(self, question, agent_executor, df):
-        """Ask question with retry logic and fallbacks"""
+        """Ask question with retry logic and improved error handling"""
         
         # Check cache first
         cache_key = hash(question)
@@ -437,15 +621,29 @@ Always provide brief insights after showing data.
                     enhanced_question = f"""
 {question}
 
-IMPORTANT: 
-- Use LIMIT 20 in SQL queries
-- Format results as markdown tables
-- Keep response under 300 words
-- If query fails, try a simpler version
+IMPORTANT INSTRUCTIONS:
+- Use LIMIT 20 in SQL queries unless specifically asked for more
+- Format results as clean markdown tables
+- Keep response under 400 words
+- If a query fails, try a simpler version
+- When using GROUP BY, include ALL non-aggregate columns in the GROUP BY clause
+- Use proper SQL syntax for SQLite
                     """
                     
                     start_time = time.time()
-                    response = agent_executor.run(enhanced_question)
+                    
+                    # Execute with timeout protection
+                    try:
+                        response = agent_executor.run(enhanced_question)
+                    except Exception as query_error:
+                        # Try fallback for specific SQL errors
+                        if "database" in str(query_error).lower() or "connection" in str(query_error).lower():
+                            st.warning(f"⚠️ Database connection issue on attempt {attempt + 1}: {str(query_error)[:100]}...")
+                            if attempt < self.max_retries - 1:
+                                time.sleep(2)
+                                continue
+                        raise query_error
+                    
                     elapsed_time = time.time() - start_time
                     
                     if response and len(response.strip()) > 0:
@@ -461,6 +659,10 @@ IMPORTANT:
                 error_msg = str(e)
                 st.warning(f"⚠️ Attempt {attempt + 1} failed: {error_msg[:100]}...")
                 
+                # Log detailed error for debugging
+                if "database" in error_msg.lower():
+                    st.error(f"Database error details: {error_msg}")
+                
                 if attempt == self.max_retries - 1:
                     # Final fallback to pandas analysis
                     fallback_result = self.fallback_analysis(question, df)
@@ -469,12 +671,33 @@ IMPORTANT:
                 
                 time.sleep(2)  # Brief pause between retries
         
-        return "❌ Unable to process the question after multiple attempts. Please try a simpler query."
+        return "❌ Unable to process the question after multiple attempts. Please try a simpler query or check the database connection."
 
     def fallback_analysis(self, question, df):
         """Fallback pandas analysis when agent fails"""
         try:
             question_lower = question.lower()
+            
+            # Handle balance/average questions
+            if 'balance' in question_lower and 'average' in question_lower:
+                balance_cols = [col for col in df.columns if 'balance' in col.lower()]
+                if balance_cols:
+                    result = "## Average Balance Analysis\n\n"
+                    
+                    # Group by available categorical columns
+                    group_cols = []
+                    for potential_col in ['gender', 'age_group', 'job', 'classification']:
+                        matching_cols = [col for col in df.columns if potential_col in col.lower()]
+                        if matching_cols:
+                            group_cols.extend(matching_cols)
+                    
+                    if group_cols and balance_cols:
+                        try:
+                            grouped = df.groupby(group_cols[:3])[balance_cols[0]].mean().reset_index()
+                            result += grouped.head(15).to_markdown(index=False, floatfmt=".2f")
+                            return result
+                        except:
+                            pass
             
             if any(word in question_lower for word in ['top', 'highest', 'maximum']):
                 # Find numeric columns and show top values
@@ -544,7 +767,7 @@ def main():
                 # Preprocess data
                 with st.spinner("Processing data..."):
                     df = app.preprocess_data(df)
-                    db_path = app.create_database(df)
+                    db_path = app.db_manager.create_database(df)
                     
                     if db_path:
                         agent_executor, db = app.create_agent(db_path)
@@ -555,6 +778,7 @@ def main():
                                 'df': df,
                                 'db_path': db_path,
                                 'agent_executor': agent_executor,
+                                'sql_database': db,
                                 'data_uploaded': True,
                                 'last_error': None
                             })
@@ -686,6 +910,22 @@ def main():
             st.session_state.messages = []
             st.session_state.analysis_cache = {}  # Clear cache too
             st.rerun()
+    
+    # Database Connection Status (Debug info)
+    if st.session_state.data_uploaded:
+        with st.expander("🔧 Debug Info"):
+            st.write("**Connection Status:**")
+            if st.session_state.db_path:
+                connection_test = app.db_manager.test_connection(st.session_state.db_path)
+                if connection_test['status'] == 'success':
+                    st.success(f"✅ Database: {connection_test['rows']:,} rows, {connection_test['columns']} columns")
+                else:
+                    st.error(f"❌ Database Error: {connection_test.get('error', 'Unknown error')}")
+            
+            st.write("**Session State:**")
+            st.write(f"- Agent Executor: {'✅ Active' if st.session_state.agent_executor else '❌ None'}")
+            st.write(f"- Database Path: {'✅ Set' if st.session_state.db_path else '❌ None'}")
+            st.write(f"- Cache Size: {len(st.session_state.analysis_cache)} entries")
     
     # Footer
     st.markdown("---")
