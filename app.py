@@ -248,7 +248,7 @@ class DataAnalysisApp:
                 st.stop()
                 
             self.llm = ChatGoogleGenerativeAI(
-                model="gemini-1.5-flash",
+                model="gemini-1.5-flash-8b",
                 google_api_key=api_key,
                 temperature=0.1,
                 max_tokens=2048,
